@@ -1,0 +1,209 @@
+name: Implement no-downgrade
+
+on:
+  push:
+    branches: [feature/no-downgrade]
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    if: "!contains(github.event.head_commit.message, '[no-downgrade-implemented]')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch source
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f'{path}: expected 1 occurrence, found {n}: {old!r}')
+              p.write_text(s.replace(old, new, 1))
+
+          # emerge CLI option and optional argument handling.
+          replace_once(
+              'lib/_emerge/main.py',
+              '    "--nobindeps",\n',
+              '    "--nobindeps",\n    "--no-downgrade",\n',
+          )
+          replace_once(
+              'lib/_emerge/main.py',
+              '        "--ignore-world": y_or_n,\n',
+              '        "--ignore-world": y_or_n,\n        "--no-downgrade": y_or_n,\n',
+          )
+
+          # Add the documented option to argument_options. Locate the existing
+          # ignore-world entry, whose exact help text is stable enough to use as
+          # an anchor while avoiding assumptions about surrounding options.
+          p = Path('lib/_emerge/main.py')
+          s = p.read_text()
+          if '"--no-downgrade": {' not in s:
+              m = re.search(
+                  r'(        "--ignore-world": \{\n(?:.*\n)*?        \},\n)',
+                  s,
+              )
+              if not m:
+                  raise SystemExit('main.py: argument_options ignore-world entry not found')
+              entry = m.group(1)
+              new_entry = entry + (
+                  '        "--no-downgrade": {\n'
+                  '            "help": "prevent dependency resolution from selecting a lower installed package version",\n'
+                  '            "choices": true_y_or_n,\n'
+                  '        },\n'
+              )
+              s = s[:m.start()] + new_entry + s[m.end():]
+              p.write_text(s)
+
+          # depgraph already exposes the existing downgrade_probe callback to
+          # dep_zapdeps. Add the policy bit beside it, using the same frozen
+          # command-line options that construct the depgraph.
+          p = Path('lib/_emerge/depgraph.py')
+          s = p.read_text()
+          needle = '            self._graph_trees[myroot]["downgrade_probe"] = depgraph._downgrade_probe\n'
+          replacement = needle + '            self._graph_trees[myroot]["no_downgrade"] = depgraph._frozen_config.myopts.get("--no-downgrade") is True\n'
+          if s.count(needle) != 1:
+              raise SystemExit(f'depgraph.py: expected graph downgrade_probe anchor once, found {s.count(needle)}')
+          s = s.replace(needle, replacement, 1)
+          needle2 = '            self._filtered_trees[myroot]["downgrade_probe"] = depgraph._downgrade_probe\n'
+          replacement2 = needle2 + '            self._filtered_trees[myroot]["no_downgrade"] = depgraph._frozen_config.myopts.get("--no-downgrade") is True\n'
+          if s.count(needle2) != 1:
+              raise SystemExit(f'depgraph.py: expected filtered downgrade_probe anchor once, found {s.count(needle2)}')
+          s = s.replace(needle2, replacement2, 1)
+          p.write_text(s)
+
+          # dep_zapdeps is the lowest-level OR-choice resolver. Reuse the
+          # exact existing installed_downgrade test: when --no-downgrade is
+          # active, a candidate classified as an installed downgrade is
+          # removed before it enters any choice bin. Recursive calls share the
+          # same trees object, so the policy propagates through nested ORs.
+          p = Path('lib/portage/dep/dep_check.py')
+          s = p.read_text()
+          needle = '    downgrade_probe = trees[myroot].get("downgrade_probe")\n'
+          if s.count(needle) != 1:
+              raise SystemExit(f'dep_check.py: downgrade_probe local anchor expected once, found {s.count(needle)}')
+          s = s.replace(
+              needle,
+              needle + '    no_downgrade = trees[myroot].get("no_downgrade", False)\n',
+              1,
+          )
+
+          # We need to distinguish a downgrade that is genuinely needed
+          # because the installed version is masked/unavailable. The existing
+          # installed_downgrade assignment already does exactly this through
+          # downgrade_probe(avail_pkg), so preserve it and only filter when it
+          # would have set installed_downgrade.
+          old = '''            if not replacing and downgrade_probe is not None and graph is not None:
+                highest_in_slot = mydbapi_match_pkgs(avail_slot)
+                highest_in_slot = highest_in_slot[-1] if highest_in_slot else None
+                if (
+                    avail_pkg
+                    and highest_in_slot
+                    and avail_pkg < highest_in_slot
+                    and not downgrade_probe(avail_pkg)
+                    and (highest_in_slot.installed or highest_in_slot in graph)
+                ):
+                    installed_downgrade = True
+'''
+          new = '''            if not replacing and downgrade_probe is not None and graph is not None:
+                highest_in_slot = mydbapi_match_pkgs(avail_slot)
+                highest_in_slot = highest_in_slot[-1] if highest_in_slot else None
+                if (
+                    avail_pkg
+                    and highest_in_slot
+                    and avail_pkg < highest_in_slot
+                    and not downgrade_probe(avail_pkg)
+                    and (highest_in_slot.installed or highest_in_slot in graph)
+                ):
+                    installed_downgrade = True
+
+            if no_downgrade and installed_downgrade:
+                # Do not put an installed-downgrade candidate into the choice
+                # bins. This makes the candidate unavailable to the lowest
+                # level resolver rather than selecting it and rejecting it
+                # afterward. The existing downgrade_probe remains the source
+                # of truth for what constitutes an ordinary downgrade.
+                continue
+'''
+          if s.count(old) != 1:
+              raise SystemExit(f'dep_check.py: installed_downgrade block expected once, found {s.count(old)}')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # Add a regression to the existing downgrade test. The first case
+          # demonstrates that normal resolution still avoids the downgrade.
+          # The masked-installed case demonstrates that --no-downgrade does
+          # not suppress a downgrade that the existing probe considers
+          # necessary.
+          p = Path('lib/portage/tests/resolver/test_or_downgrade_installed.py')
+          s = p.read_text()
+          anchor = '''            ResolverPlaygroundTestCase(
+                ["net-misc/foo"],
+                success=True,
+                mergelist=[
+                    "net-libs/libtirpc-1",
+                    "net-misc/foo-1",
+                ],
+            ),
+'''
+          addition = anchor + '''            ResolverPlaygroundTestCase(
+                ["net-misc/foo"],
+                options={"--no-downgrade": True},
+                success=True,
+                mergelist=[
+                    "net-libs/libtirpc-1",
+                    "net-misc/foo-1",
+                ],
+            ),
+'''
+          if s.count(anchor) != 1:
+              raise SystemExit(f'test_or_downgrade_installed.py: first test anchor expected once, found {s.count(anchor)}')
+          s = s.replace(anchor, addition, 1)
+
+          # In the masked-installed case, glibc-2.24 is a necessary downgrade
+          # according to downgrade_probe, so --no-downgrade must still permit it.
+          anchor2 = '''            ResolverPlaygroundTestCase(
+                ["net-misc/foo"],
+                success=True,
+                mergelist=[
+                    "sys-libs/glibc-2.24",
+                    "net-misc/foo-1",
+                ],
+            ),
+'''
+          addition2 = anchor2 + '''            ResolverPlaygroundTestCase(
+                ["net-misc/foo"],
+                options={"--no-downgrade": True},
+                success=True,
+                mergelist=[
+                    "sys-libs/glibc-2.24",
+                    "net-misc/foo-1",
+                ],
+            ),
+'''
+          if s.count(anchor2) != 1:
+              raise SystemExit(f'test_or_downgrade_installed.py: masked test anchor expected once, found {s.count(anchor2)}')
+          s = s.replace(anchor2, addition2, 1)
+          p.write_text(s)
+
+      - name: Syntax check
+        run: python -m compileall -q lib/_emerge/main.py lib/_emerge/depgraph.py lib/portage/dep/dep_check.py lib/portage/tests/resolver/test_or_downgrade_installed.py
+
+      - name: Run resolver regression
+        run: python -m portage.tests.resolver.test_or_downgrade_installed
+
+      - name: Commit implementation
+        shell: bash
+        run: |
+          git config user.name 'genbtc-portage-bot'
+          git config user.email 'genbtc@users.noreply.github.com'
+          git add lib/_emerge/main.py lib/_emerge/depgraph.py lib/portage/dep/dep_check.py lib/portage/tests/resolver/test_or_downgrade_installed.py
+          git diff --cached --check
+          git commit -m 'emerge: add --no-downgrade resolver policy [no-downgrade-implemented]'
+          git push origin feature/no-downgrade
